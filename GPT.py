@@ -19,50 +19,87 @@ max_iters = 5_000
 eval_iters = 200
 eval_interval = 500
 
-class Head(nn.Module):
-    """One head of self attention"""
-    
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_emb, head_size, bias=False)
-        self.query = nn.Linear(n_emb, head_size, bias=False)
-        self.value = nn.Linear(n_emb, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length)))
-        
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        # input of size (Batch, Time, Channels)
-        # output of size (Batch, Time, Head Size)
-        B, T, C = x.shape
-        # Get the key, query and value vectors
-        k = self.key(x) # (B, T, HS)
-        q = self.query(x) # (B, T, HS)
-        v = self.value(x) # (B, T, HS)
-        
-        # Compute attention scores using scaled dot-product
-        weights = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5 # (B, T, HS) @ (B, HS, T) --> (B, T, T)
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        weights = F.softmax(weights, -1)
-        weights = self.dropout(weights)
-        
-        out = weights @ v
-        return out
-    
 class MultiHeadAttention(nn.Module):
     """Multiple Heads of self-attention in parallel"""
     
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
-        self.proj = nn.Linear(head_size * num_heads, n_emb)
+        self.n_heads = n_heads
+        self.head_size = head_size
+        self.qkv = nn.Linear(n_emb, 3 * n_emb, bias=False)
+        self.proj = nn.Linear(n_emb, n_emb)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1) # (B, T, head_size * num_heads)
-        out = self.proj(out) # (B, T, n_emb)
-        out = self.dropout(out)
-        return out
+        self.k_cache = None
+        self.v_cache = None
+        self.cache_pos = 0
+    
+    def reset_cache(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.cache_pos = 0
+    
+    def forward(self, x, use_cache=False):
+        B, T, C = x.shape
+        # compue q, k and v vectors
+        qkv = self.qkv(x)
+        q, k, v = torch.split(qkv, C, dim=2)
+        # reshape for multi-head attention
+        q = q.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        
+        if use_cache:
+            # kv cache path
+            if self.k_cache is None:
+                # initialize cache
+                self.k_cache = torch.zeros(
+                    (B, self.n_heads, context_length, self.head_size),
+                    dtype=x.dtype, device=device
+                )
+                self.v_cache = torch.zeros_like(self.k_cache)
+                self.cache_pos = 0
+            
+            # if cache is full, then reset
+            if self.cache_pos + T > context_length:
+                self.k_cache.zero_()
+                self.v_cache.zero_()
+                self.cache_pos = 0
+            
+            old_k = self.k_cache[:, :, :self.cache_pos]
+            old_v = self.v_cache[:, :, :self.cache_pos]
+            # use the full cache for attention
+            full_k = torch.cat([old_k, k], dim=2)
+            full_v = torch.cat([old_v, v], dim=2)
+            total_len = self.cache_pos + T
+            if T == 1:
+                causal_mask = torch.ones(T, total_len, device=device, dtype=torch.bool)
+            else:
+                causal_mask = torch.tril(torch.ones(T, total_len, device=device, dtype=torch.bool))
+            
+            weights = (q @ full_k.transpose(-2, -1)) * (self.head_size ** -0.5)
+            # apply causal masking
+            weights = weights.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            weights = F.softmax(weights, dim=-1)
+            weights = self.dropout(weights)
+            out = weights @ full_v
+            
+            # store new K/V in cache
+            self.k_cache[:, :, self.cache_pos:self.cache_pos+T] = k
+            self.v_cache[:, :, self.cache_pos:self.cache_pos+T] = v
+            self.cache_pos += T
+        else:
+            # standard path
+            causal_mask = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
+            weights = (q @ k.transpose(-2, -1)) * (self.head_size ** -0.5)
+            # apply causal masking
+            weights = weights.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            weights = F.softmax(weights, dim=-1)
+            weights = self.dropout(weights)
+            out = weights @ v # shape: (batch, n_heads, time, head_size)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C) # (batch, time, channel)
+        return self.proj(out)
     
 class FeedForwardNetwork(nn.Module):
     """A simple linear layer followed by non-linear layer"""
@@ -93,8 +130,8 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_emb)
         self.ln2 = nn.LayerNorm(n_emb)
         
-    def forward(self, x):
-        x = x + self.sa_heads(self.ln1(x)) # Pre-normalization, Residual connection + output from multi-head attention block
+    def forward(self, x, use_cache=False):
+        x = x + self.sa_heads(self.ln1(x), use_cache=use_cache) # Pre-normalization, Residual connection + output from multi-head attention block
         x = x + self.ffwd(self.ln2(x)) # Pre-normalization, Residual connection + output from ffwd network
         return x
         
@@ -106,7 +143,7 @@ class GPTLanguageModel(nn.Module):
         # Creating a position embedding table which will store positional information
         self.position_embedding_table = nn.Embedding(context_length, n_emb)
         # Creating transformer blocks
-        self.blocks = nn.Sequential(*[Block(num_heads, n_emb) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(num_heads, n_emb) for _ in range(n_layers)])
         # Final Layer norm layer
         self.ln_f = nn.LayerNorm(n_emb)
         # Creating a linear layer for getting logits from embeddings
@@ -121,16 +158,17 @@ class GPTLanguageModel(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            
         
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, use_cache=False, start_pos=0):
         B, T = idx.shape
         
         # Both idx and targets are tensors of integers of size (Batch, Time), idx is the input token
+        pos = (start_pos + torch.arange(T, device=device)) % context_length
         token_emb = self.token_embedding_table(idx) # (Batch, Time, Channels), Channels = n_emb
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        pos_emb = self.position_embedding_table(pos)
         x = token_emb + pos_emb # Now our input contains both token emb and its positional info
-        x = self.blocks(x)
+        for block in self.blocks:
+            x = block(x, use_cache=use_cache)
         x = self.ln_f(x)
         logits = self.lm_head(x) # (Batch, Time, vocab_size)
         
@@ -143,14 +181,17 @@ class GPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
         
         return logits, loss
-    
+           
+    @torch.no_grad()     
     def generate(self, idx, max_new_tokens):
         # idx is the (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
-            # crop idx upto context length
+            # only feed the last token after first step
             idx_cond = idx[:, -context_length:]
+            seq_len = idx.size(1)
+            start_pos = max(0, seq_len - context_length)
             # Create initial logits
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, use_cache=False, start_pos=start_pos)
             # Focus only on the last time step as only that token is predicted
             logits = logits[:, -1, :] # (B, C)
             # Generate probabilities with softmax layer
@@ -158,9 +199,62 @@ class GPTLanguageModel(nn.Module):
             # sample the next token
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # Concatenate it with original idx to generate next input
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
+            idx = torch.cat([idx, idx_next], dim=1) # (B, T+1)
         
+        return idx
+    
+    @torch.no_grad()
+    def generate_with_cache(self, idx, max_new_tokens):
+        self.eval()
+        # reset cache
+        for block in self.blocks:
+            block.sa_heads.reset_cache()
+            
+        full_seq = idx.clone()
+        seq_len = idx.size(1)
+        
+        # initial decoder fill
+        logits, _ = self(idx, use_cache=True, start_pos=0)
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        
+        idx = torch.cat([idx, idx_next], dim=1)
+        full_seq = torch.cat([full_seq, idx_next], dim=1)
+        seq_len += 1
+        
+        # generation loop
+        for _ in range(1, max_new_tokens):
+            # chunking logic
+            if seq_len >= context_length:
+                # recover the last half of the tokens
+                recover_len = context_length // 2
+                context_window = full_seq[:, -recover_len:]
+                
+                # hard reset cache
+                for block in self.blocks:
+                    block.sa_heads.reset_cache()
+                    
+                # refill the cache with the window
+                # Note - we reset the position ids to 0..recover_len to match the reset cache
+                logits, _ = self(context_window, use_cache=True, start_pos=0)
+                idx = context_window
+                seq_len = recover_len
+            
+            # we are feeding 1 token. Position is relative to current cache size
+            last_token = idx[:, -1:]
+            start_pos = seq_len - 1
+            
+            logits, _ = self(last_token, use_cache=True, start_pos=start_pos)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            idx = torch.cat([idx, idx_next], dim=1)
+            full_seq = torch.cat([full_seq, idx_next], dim=1)
+            seq_len += 1
+        
+        return full_seq
     
 with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
@@ -224,6 +318,8 @@ else:
     best_val_loss = float('inf')
     
 # Training loop
+model.train()
+# Disable KV cache during training
 for iter in range(max_iters):
     # Evaluate model after a particular interval
     if iter % eval_interval == 0 or iter == max_iters-1:
@@ -265,7 +361,9 @@ if os.path.exists(checkpoint_path):
 # Generating from model
 prompt = "First Citizen:"
 context = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
-output = model.generate(context, max_new_tokens=10_000)[0].tolist()
+model.eval()
+with torch.no_grad():
+    output = model.generate_with_cache(context, max_new_tokens=10_000)[0].tolist()
 text = decode(output)
 
 with open("more.txt", "w") as f:
